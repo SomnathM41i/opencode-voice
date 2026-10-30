@@ -12,9 +12,12 @@ One Next.js app (frontend + backend), one reused OpenCode session.
 ## First run
 
 ```bash
-cd ~/opencode-voice
+cd "/mnt/c/Users/Somnath Mali/Desktop/opencode-voice"
 npm install          # already done once
 ```
+
+Run everything from WSL: `node_modules` holds Linux binaries, and OpenCode is
+installed there.
 
 Terminal 1 — OpenCode server:
 
@@ -36,14 +39,24 @@ On Windows, open **http://localhost:3000** in Chrome.
 ## How to use it
 
 1. Tap the mic. The dot turns blue: **Listening**.
-2. Speak. Chrome ends the turn when you stop talking.
+2. Speak. The turn is sent after about two seconds of silence, or three and a
+   half if your sentence ends on a word like "to" or "so", so a pause to think
+   does not cut you off. On Android the browser decides when you
+   have finished, so a long pause there can still end the turn.
 3. Tap the mic again to send immediately instead of waiting.
-4. Watch the reply stream in; it starts speaking at the first clause.
+4. Watch the reply stream in; it starts speaking at the first sentence.
 5. With **Hands-free** on, the mic reopens ~0.4 s after the reply finishes, so
    you can just keep talking. The gap is deliberate: it stops the mic hearing
-   the last word of the reply.
-6. Tap the mic while it is thinking or speaking to interrupt and talk over it.
-   The **Stop** button (or **Escape**) stops without reopening the mic.
+   the last word of the reply. If you stay quiet, it keeps listening through
+   three more silence windows, then rests until you tap it.
+6. While it is working, the screen names the current step, and it says "One
+   moment" if it goes quiet. Tap the mic for an update; the work keeps running.
+7. Tap the mic while it is speaking to interrupt and talk over it. The **Stop**
+   button (or **Escape**) cancels a reply at any point.
+
+Only the short answer is spoken: the first few sentences, up to any blank line,
+list, or table. The rest stays on screen. Turn on **Read full replies** in
+settings to hear everything.
 
 Text fallback works too — type and press Enter, even while the mic is listening;
 typing takes over from the microphone.
@@ -124,6 +137,11 @@ OpenCode on 127.0.0.1:4096
 - `/api/stop` interrupts the running OpenCode turn.
 - Turns are guarded by a random token, so a late Stop from an older turn cannot
   interrupt a newer one.
+- An interrupted turn is awaited until OpenCode reports it ended, because a
+  prompt sent into a running execution is merged into it.
+- A turn ends after 90 s with no agent activity, or at 10 minutes regardless.
+- Each message carries short voice-mode rules (`VOICE_RULES` in
+  `src/lib/opencode.ts`), so they also appear in exported session history.
 - Requests are checked for a known Origin and a JSON content type; the browser
   never talks to OpenCode directly.
 
@@ -164,7 +182,18 @@ turn feels slow.
 - Speech recognition is Chrome's built-in service; it needs a network connection and is not available in every browser.
 - `localhost` is a secure context, so the mic works there. Opening this from a phone over LAN needs HTTPS first.
 - One turn at a time by design. The mic stays available for barge-in, but a new spoken turn waits until the old one is stopped.
+- Barge-in is by tap, not by voice: an open mic would hear the reply through the speakers.
+- An interrupted question stays in OpenCode's history, so the next reply may also address it.
 - The OpenCode session is kept in the Next.js process, so restarting the app starts a fresh conversation.
+
+## Checks
+
+```bash
+npm run typecheck
+npm run verify       # speech chunking, end of speech, and turn orderings
+```
+
+`verify` needs no OpenCode server: it runs the API routes against a fake one.
 
 ## Troubleshooting
 

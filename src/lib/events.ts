@@ -2,7 +2,7 @@
  * One persistent SSE connection to OpenCode, shared by every turn.
  * Events are fanned out to in-process listeners (the chat route).
  */
-import { openEventStream } from "./opencode";
+import { interruptSession, openEventStream } from "./opencode";
 
 export type OpenCodeEvent = {
   id?: string;
@@ -140,6 +140,37 @@ export function subscribe(listener: Listener): () => void {
 
 export function streamStatus() {
   return { connected: bus.connected, error: bus.lastError };
+}
+
+const TERMINAL_EVENTS = new Set([
+  "session.execution.succeeded",
+  "session.execution.failed",
+  "session.execution.interrupted",
+]);
+
+/**
+ * Interrupts a session and resolves once its execution has really ended.
+ * OpenCode answers the interrupt before the run is over, and a prompt sent into
+ * a run still alive is merged into it instead of starting a new turn.
+ */
+export function interruptAndWait(sessionID: string, timeoutMs = 1_500): Promise<void> {
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      unsubscribe();
+      resolve();
+    };
+    const timer = setTimeout(done, timeoutMs);
+    const unsubscribe = subscribe((event) => {
+      if (event.data?.sessionID === sessionID && TERMINAL_EVENTS.has(event.type)) {
+        done();
+      }
+    });
+
+    void interruptSession(sessionID).then((interrupted) => {
+      if (interrupted === false) done();
+    });
+  });
 }
 
 /**

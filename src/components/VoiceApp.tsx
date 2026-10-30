@@ -2,9 +2,11 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  MAX_SPOKEN_SENTENCES,
   Speaker,
   createRecognition,
   friendlySpeechError,
+  speakablePart,
   speechSupported,
   takeSpeakable,
   warmUpVoices,
@@ -55,6 +57,7 @@ const modelKey = (providerID: string, id: string) => `${providerID}:${id}`;
 const SPEECH_PRESETS = [0.9, 1, 1.1, 1.2, 1.3, 1.4, 1.5, 1.75, 2];
 const DEFAULT_SPEECH_RATE = 1.1;
 const RATE_STORAGE_KEY = "opencode-voice.speechRate";
+const SPEAK_ALL_STORAGE_KEY = "opencode-voice.speakAll";
 
 function rateLabel(rate: number): string {
   return `${Number(rate.toFixed(2))}×`;
@@ -71,12 +74,23 @@ type Turn = {
   cancelled: boolean;
   autoStarted: boolean;
   hadText: boolean;
+  needsBreak: boolean;
+  activity: string | null;
+  statusLines: number;
+  spokeReply: boolean;
+  block: string;
+  blockConsumed: number;
+  blockSentences: number;
+  blockMuted: boolean;
 };
 
 type ChatEvent =
   | { type: "session"; sessionID: string; agent?: string; model?: SessionInfo["model"] }
   | { type: "admitted"; messageID: string; at: number }
   | { type: "delta"; text: string; at: number }
+  | { type: "text-end"; at: number }
+  | { type: "tool"; name: string; at: number }
+  | { type: "activity"; at: number }
   | { type: "done"; outcome: string; at: number }
   | { type: "error"; code: string; message: string; at: number };
 
@@ -84,6 +98,34 @@ const EMPTY_METRICS: Metrics = { firstToken: null, firstAudio: null, total: null
 
 /** Quiet gap after speech before the mic reopens, so it cannot hear its own tail. */
 const AUTO_LISTEN_DELAY_MS = 420;
+
+/** Quiet listening windows hands-free waits through before it goes to rest. */
+const HANDS_FREE_REARMS = 3;
+const REARM_DELAY_MS = 250;
+
+/** Backstop for a dead server; the server's own 90s idle limit fires first. */
+const TURN_SILENCE_LIMIT_MS = 100_000;
+
+/** How often to retry while the server finishes releasing the previous turn. */
+const BUSY_RETRIES = 3;
+const BUSY_RETRY_DELAY_MS = 400;
+
+/** Silence before the app speaks up on the agent's behalf, then between lines. */
+const FIRST_STATUS_MS = 8_000;
+const NEXT_STATUS_MS = 20_000;
+
+const TOOL_LABELS: [RegExp, string][] = [
+  [/shell|bash|exec|command/i, "Running a command"],
+  [/read/i, "Reading a file"],
+  [/edit|write|patch/i, "Editing a file"],
+  [/search|grep|glob|find/i, "Searching"],
+  [/web|fetch|browse/i, "Checking the web"],
+  [/task|agent/i, "Asking a helper"],
+];
+
+function toolLabel(name: string): string {
+  return TOOL_LABELS.find(([pattern]) => pattern.test(name))?.[1] ?? "Working";
+}
 
 function seconds(value: number | null): string {
   if (value === null) return "—";
@@ -235,6 +277,8 @@ export default function VoiceApp() {
   const [standalone, setStandalone] = useState(false);
   const [isIOS, setIsIOS] = useState(false);
   const [speechRate, setSpeechRate] = useState(DEFAULT_SPEECH_RATE);
+  const [speakAll, setSpeakAll] = useState(false);
+  const [activity, setActivity] = useState<string | null>(null);
   const [models, setModels] = useState<OpenCodeModelOption[]>([]);
   const [modelKeyValue, setModelKeyValue] = useState("");
 
@@ -242,6 +286,8 @@ export default function VoiceApp() {
   const turnRef = useRef<Turn | null>(null);
   const speakerRef = useRef<Speaker | null>(null);
   const previewRef = useRef<Speaker | null>(null);
+  const statusRef = useRef<Speaker | null>(null);
+  const speakAllRef = useRef(false);
   const rateRef = useRef(DEFAULT_SPEECH_RATE);
   const sendGuardRef = useRef(false);
   const idRef = useRef(1);
@@ -252,7 +298,9 @@ export default function VoiceApp() {
   const inputRef = useRef<HTMLInputElement | null>(null);
   const phaseRef = useRef<Phase>("idle");
   const autoListenRef = useRef(true);
-  const startListeningRef = useRef<() => void>(() => {});
+  const startListeningRef = useRef<(keepRearms?: boolean) => void>(() => {});
+  const listenTimerRef = useRef<number | undefined>(undefined);
+  const rearmsRef = useRef(0);
 
   useEffect(() => {
     phaseRef.current = phase;
@@ -289,6 +337,27 @@ export default function VoiceApp() {
       /* first run, or storage blocked */
     }
   }, [applySpeechRate]);
+
+  useEffect(() => {
+    try {
+      const stored = window.localStorage.getItem(SPEAK_ALL_STORAGE_KEY) === "true";
+      speakAllRef.current = stored;
+      setSpeakAll(stored);
+    } catch {
+      /* first run, or storage blocked */
+    }
+  }, []);
+
+  const toggleSpeakAll = useCallback(() => {
+    const next = !speakAllRef.current;
+    speakAllRef.current = next;
+    setSpeakAll(next);
+    try {
+      window.localStorage.setItem(SPEAK_ALL_STORAGE_KEY, String(next));
+    } catch {
+      /* storage may be unavailable in private mode */
+    }
+  }, []);
 
   useEffect(() => {
     const update = () => setIsOnline(navigator.onLine);
@@ -444,7 +513,23 @@ export default function VoiceApp() {
     );
   }, []);
 
+  const scheduleListen = useCallback((delay: number) => {
+    window.clearTimeout(listenTimerRef.current);
+    listenTimerRef.current = window.setTimeout(() => {
+      if (!autoListenRef.current) return;
+      if (phaseRef.current !== "idle") return;
+      startListeningRef.current(true);
+    }, delay);
+  }, []);
+
+  const cancelScheduledListen = useCallback(() => {
+    window.clearTimeout(listenTimerRef.current);
+    rearmsRef.current = 0;
+  }, []);
+
   const stopEverything = useCallback((): Promise<void> => {
+    cancelScheduledListen();
+
     const turn = turnRef.current;
     if (turn) {
       turn.cancelled = true;
@@ -454,6 +539,8 @@ export default function VoiceApp() {
     }
 
     speakerRef.current?.stop();
+    statusRef.current?.stop();
+    setActivity(null);
 
     try {
       recognitionRef.current?.abort();
@@ -485,15 +572,30 @@ export default function VoiceApp() {
     finalizeAssistant();
 
     return acknowledged;
-  }, [finalizeAssistant]);
+  }, [cancelScheduledListen, finalizeAssistant]);
+
+  /**
+   * Speaks a progress line on its own speaker, so it never counts as the reply
+   * and a tap during it cannot be taken for interrupting the reply.
+   */
+  const sayStatus = useCallback(
+    (line: string) => {
+      const status = new Speaker(lang, rateRef.current);
+      statusRef.current = status;
+      status.enqueue(line);
+    },
+    [lang],
+  );
 
   const runTurn = useCallback(
     async (text: string) => {
+      cancelScheduledListen();
       previewRef.current?.stop();
       previewRef.current = null;
       setNotice(null);
       setInterim("");
       setMetrics(EMPTY_METRICS);
+      setActivity(null);
       setPhase("thinking");
       stickToBottomRef.current = true;
       setMessages((prev) => [...prev, { id: idRef.current++, role: "user", text }]);
@@ -511,8 +613,29 @@ export default function VoiceApp() {
         cancelled: false,
         autoStarted: false,
         hadText: false,
+        needsBreak: false,
+        activity: null,
+        statusLines: 0,
+        spokeReply: false,
+        block: "",
+        blockConsumed: 0,
+        blockSentences: 0,
+        blockMuted: false,
       };
       turnRef.current = turn;
+
+      // The reply is fully over: stream closed and speech drained.
+      const settle = () => {
+        setActivity(null);
+        setPhase("idle");
+        if (turnRef.current === turn) turnRef.current = null;
+
+        if (autoListenRef.current && !turn.autoStarted) {
+          turn.autoStarted = true;
+          rearmsRef.current = HANDS_FREE_REARMS;
+          scheduleListen(AUTO_LISTEN_DELAY_MS);
+        }
+      };
 
       speaker.onStart = () => {
         setVoiceLabel(speaker.voiceName);
@@ -534,21 +657,69 @@ export default function VoiceApp() {
           return;
         }
 
-        setPhase("idle");
+        settle();
+      };
 
-        if (turnRef.current === turn) turnRef.current = null;
-
-        if (autoListenRef.current && !turn.autoStarted) {
-          turn.autoStarted = true;
-          window.setTimeout(() => {
-            if (!autoListenRef.current) return;
-            if (phaseRef.current !== "idle") return;
-            startListeningRef.current();
-          }, AUTO_LISTEN_DELAY_MS);
+      const speakSegments = (segments: string[]) => {
+        for (const segment of segments) {
+          if (!speakAllRef.current && turn.blockSentences >= MAX_SPOKEN_SENTENCES) {
+            turn.blockMuted = true;
+            turn.pending = "";
+            return;
+          }
+          turn.blockSentences += 1;
+          turn.spokeReply = true;
+          speaker.enqueue(segment);
         }
       };
 
+      const flushSpeech = () => {
+        const { segments } = takeSpeakable(turn.pending, true);
+        turn.pending = "";
+        speakSegments(segments);
+      };
+
+      // Reads only the short answer unless the full reply was asked for; the
+      // whole block is measured each time because a cut can span two deltas.
+      const speakDelta = (delta: string) => {
+        turn.block += delta;
+        if (turn.blockMuted) return;
+
+        const wanted = speakAllRef.current ? turn.block : speakablePart(turn.block);
+        const fresh = wanted.slice(turn.blockConsumed);
+        const cut = wanted.length < turn.block.length;
+        turn.blockConsumed = wanted.length;
+
+        const { segments, rest } = takeSpeakable(turn.pending + fresh, cut);
+        turn.pending = rest;
+        speakSegments(segments);
+        if (cut) turn.blockMuted = true;
+      };
+
+      const endBlock = () => {
+        flushSpeech();
+        turn.block = "";
+        turn.blockConsumed = 0;
+        turn.blockSentences = 0;
+        turn.blockMuted = false;
+      };
+
+      let statusTimer: number | undefined;
+      const scheduleStatus = (delay: number) => {
+        window.clearTimeout(statusTimer);
+        statusTimer = window.setTimeout(() => {
+          if (turn.cancelled || turn.streamDone) return;
+          if (!speaker.busy) {
+            sayStatus(turn.statusLines === 0 ? "One moment." : "Still working.");
+            turn.statusLines += 1;
+          }
+          scheduleStatus(NEXT_STATUS_MS);
+        }, delay);
+      };
+
       const handleEvent = (event: ChatEvent) => {
+        if (turn.cancelled) return;
+
         switch (event.type) {
           case "session":
             setSessionInfo({
@@ -561,6 +732,9 @@ export default function VoiceApp() {
 
           case "delta": {
             turn.hadText = true;
+            turn.activity = null;
+            setActivity(null);
+            scheduleStatus(NEXT_STATUS_MS);
             if (!turn.firstToken) {
               turn.firstToken = true;
               setMetrics((current) => ({
@@ -569,19 +743,36 @@ export default function VoiceApp() {
               }));
             }
 
-            appendAssistant(event.text);
-
-            const { segments, rest } = takeSpeakable(turn.pending + event.text, false);
-            turn.pending = rest;
-            for (const segment of segments) speaker.enqueue(segment);
+            appendAssistant(turn.needsBreak ? `\n\n${event.text}` : event.text);
+            turn.needsBreak = false;
+            speakDelta(event.text);
             break;
           }
 
+          case "tool": {
+            const label = toolLabel(event.name);
+            turn.activity = label;
+            setActivity(label);
+            scheduleStatus(NEXT_STATUS_MS);
+            if (!turn.hadText && turn.statusLines === 0 && !speaker.busy) {
+              sayStatus("One moment.");
+              turn.statusLines += 1;
+            }
+            break;
+          }
+
+          // A text block is complete. Speak its tail now instead of waiting for
+          // the turn to end, and keep it apart from any text after a tool call.
+          case "text-end":
+            endBlock();
+            turn.needsBreak = turn.hadText;
+            break;
+
           case "done": {
             turn.streamDone = true;
-            const { segments } = takeSpeakable(turn.pending, true);
-            turn.pending = "";
-            for (const segment of segments) speaker.enqueue(segment);
+            endBlock();
+            // A reply that was all table or list must still sound like an answer.
+            if (turn.hadText && !turn.spokeReply) speaker.enqueue("It's on screen.");
             setMetrics((current) => ({
               ...current,
               total: Math.round(performance.now() - turn.startedAt),
@@ -593,18 +784,7 @@ export default function VoiceApp() {
               ]);
             }
             finalizeAssistant();
-            if (!speaker.busy) {
-              setPhase("idle");
-              turnRef.current = null;
-              if (autoListenRef.current && !turn.autoStarted) {
-                turn.autoStarted = true;
-                window.setTimeout(() => {
-                  if (!autoListenRef.current) return;
-                  if (phaseRef.current !== "idle") return;
-                  startListeningRef.current();
-                }, AUTO_LISTEN_DELAY_MS);
-              }
-            }
+            if (!speaker.busy) settle();
             break;
           }
 
@@ -615,6 +795,8 @@ export default function VoiceApp() {
             speaker.stop();
             finalizeAssistant();
             setPhase("idle");
+            if (turnRef.current === turn) turnRef.current = null;
+            setActivity(null);
             break;
           }
 
@@ -623,32 +805,49 @@ export default function VoiceApp() {
         }
       };
 
-      const watchdog = window.setTimeout(() => {
-        if (turnRef.current !== turn || turn.streamDone) return;
-        turn.cancelled = true;
-        turn.abort.abort();
-        speaker.stop();
-        finalizeAssistant();
-        setPhase("idle");
-        turnRef.current = null;
-        setNotice({
-          message: "No response after 95 seconds — the turn was cancelled.",
-          source: "opencode",
-        });
-        void fetch("/api/stop", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ turnId: turn.id }),
-        }).catch(() => {});
-      }, 95_000);
+      let watchdog: number | undefined;
+      const armWatchdog = () => {
+        window.clearTimeout(watchdog);
+        watchdog = window.setTimeout(() => {
+          if (turnRef.current !== turn || turn.streamDone) return;
+          turn.cancelled = true;
+          turn.abort.abort();
+          speaker.stop();
+          finalizeAssistant();
+          setPhase("idle");
+          turnRef.current = null;
+          setNotice({
+            message: `No response for ${TURN_SILENCE_LIMIT_MS / 1000} seconds — the turn was cancelled.`,
+            source: "opencode",
+          });
+          void fetch("/api/stop", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ turnId: turn.id }),
+          }).catch(() => {});
+        }, TURN_SILENCE_LIMIT_MS);
+      };
 
-      try {
-        const response = await fetch("/api/chat", {
+      const postTurn = () =>
+        fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ text, turnId: turn.id }),
           signal: turn.abort.signal,
         });
+
+      armWatchdog();
+      scheduleStatus(FIRST_STATUS_MS);
+
+      try {
+        let response = await postTurn();
+
+        // A barge-in can land just before the server lets go of the old turn.
+        for (let retry = 0; retry < BUSY_RETRIES && response.status === 409; retry += 1) {
+          await new Promise((resolve) => window.setTimeout(resolve, BUSY_RETRY_DELAY_MS));
+          if (turn.cancelled) return;
+          response = await postTurn();
+        }
 
         if (!response.ok || !response.body) {
           const data = await response.json().catch(() => null);
@@ -666,6 +865,7 @@ export default function VoiceApp() {
           const { value, done } = await reader.read();
           if (done) break;
 
+          armWatchdog();
           buffer += decoder.decode(value, { stream: true });
 
           let newline: number;
@@ -686,28 +886,36 @@ export default function VoiceApp() {
           caught instanceof Error ? caught.message : "The request failed.";
         setNotice({ message, source: "opencode" });
         turn.cancelled = true;
+        turn.streamDone = true;
         speaker.stop();
         finalizeAssistant();
         setPhase("idle");
+        if (turnRef.current === turn) turnRef.current = null;
         return;
       } finally {
         window.clearTimeout(watchdog);
+        window.clearTimeout(statusTimer);
       }
 
-      if (!turn.streamDone) {
-        const { segments } = takeSpeakable(turn.pending, true);
-        for (const segment of segments) speaker.enqueue(segment);
+      // The stream closed without an ending, so the server went away. Finish
+      // what was already received, and leave the mic shut so the notice is read.
+      if (!turn.streamDone && !turn.cancelled) {
+        turn.streamDone = true;
+        turn.autoStarted = true;
+        setNotice({
+          message: "The connection dropped before the reply finished.",
+          source: "app",
+        });
+        endBlock();
         finalizeAssistant();
-        if (!speaker.busy) {
-          setPhase("idle");
-          turnRef.current = null;
-        }
+        if (!speaker.busy) settle();
       }
     },
-    [appendAssistant, finalizeAssistant, lang],
+    [appendAssistant, cancelScheduledListen, finalizeAssistant, lang, sayStatus, scheduleListen],
   );
 
-  const startListening = useCallback(() => {
+  const startListening = useCallback((keepRearms = false) => {
+    if (!keepRearms) cancelScheduledListen();
     previewRef.current?.stop();
     previewRef.current = null;
     setNotice(null);
@@ -731,6 +939,7 @@ export default function VoiceApp() {
       onFinal: (text) => {
         if (sendGuardRef.current) return;
         sendGuardRef.current = true;
+        rearmsRef.current = 0;
         setInterim("");
         try {
           recognitionRef.current?.stop();
@@ -742,15 +951,26 @@ export default function VoiceApp() {
       },
       onError: (code) => {
         if (code === "aborted") return;
+        rearmsRef.current = 0;
         setNotice({ message: friendlySpeechError(code), source: "speech" });
         setPhase("idle");
         // Put the cursor where the user can keep going without the mic.
         inputRef.current?.focus();
       },
       onEnd: () => {
-        if (!sendGuardRef.current && phaseRef.current === "listening") {
-          setPhase("idle");
-          setInterim("");
+        // A session already replaced or sent has nothing left to say here.
+        if (recognitionRef.current !== recognition) return;
+        recognitionRef.current = null;
+        if (sendGuardRef.current) return;
+
+        setInterim("");
+        if (phaseRef.current === "listening") setPhase("idle");
+
+        // Nothing was said. Keep the conversation open for a while, since a
+        // reply often takes a moment of thought.
+        if (rearmsRef.current > 0 && autoListenRef.current) {
+          rearmsRef.current -= 1;
+          scheduleListen(REARM_DELAY_MS);
         }
       },
     });
@@ -777,7 +997,7 @@ export default function VoiceApp() {
       });
       setPhase("idle");
     }
-  }, [lang, runTurn]);
+  }, [cancelScheduledListen, lang, runTurn, scheduleListen]);
 
   useEffect(() => {
     startListeningRef.current = startListening;
@@ -785,6 +1005,7 @@ export default function VoiceApp() {
 
   const onMicClick = useCallback(() => {
     if (phase === "listening") {
+      rearmsRef.current = 0;
       try {
         recognitionRef.current?.stop();
       } catch {
@@ -793,20 +1014,28 @@ export default function VoiceApp() {
       return;
     }
 
-    if (phase === "thinking" || phase === "speaking") {
+    // Checking in must not cost the work: answer, and leave the turn running.
+    if (phase === "thinking") {
+      sayStatus(turnRef.current?.activity ? `${turnRef.current.activity}.` : "Still working.");
+      return;
+    }
+
+    if (phase === "speaking") {
       const acknowledged = stopEverything();
       // Interrupt, wait for OpenCode to confirm, then go straight back to the
       // mic — like a real conversation, without racing the old turn.
       if (autoListenRef.current) {
         void acknowledged.then(() => {
-          if (autoListenRef.current) startListeningRef.current();
+          if (autoListenRef.current && phaseRef.current === "idle") {
+            startListeningRef.current();
+          }
         });
       }
       return;
     }
 
     startListening();
-  }, [phase, startListening, stopEverything]);
+  }, [phase, sayStatus, startListening, stopEverything]);
 
   const sendText = useCallback(
     (raw: string): boolean => {
@@ -874,8 +1103,8 @@ export default function VoiceApp() {
 
   const applyModel = useCallback(
     async (nextProviderID: string, nextId: string) => {
-      const nextKey = modelKey(nextProviderID, nextId);
-      setModelKeyValue(nextKey);
+      const previousKey = modelKeyValue;
+      setModelKeyValue(modelKey(nextProviderID, nextId));
 
       try {
         const response = await fetch("/api/session/model", {
@@ -901,18 +1130,20 @@ export default function VoiceApp() {
           return;
         }
 
+        setModelKeyValue(previousKey);
         setNotice({
           message: data?.error || "Could not switch the model.",
           source: "opencode",
         });
       } catch {
+        setModelKeyValue(previousKey);
         setNotice({
           message: "Could not switch the model right now.",
           source: "app",
         });
       }
     },
-    [],
+    [modelKeyValue],
   );
 
   const previewVoice = useCallback(() => {
@@ -934,6 +1165,7 @@ export default function VoiceApp() {
       const next = !value;
       autoListenRef.current = next;
       if (!next) {
+        cancelScheduledListen();
         sendGuardRef.current = true;
         try {
           recognitionRef.current?.abort();
@@ -945,7 +1177,7 @@ export default function VoiceApp() {
       }
       return next;
     });
-  }, []);
+  }, [cancelScheduledListen]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1024,7 +1256,7 @@ export default function VoiceApp() {
     phase === "listening"
       ? "I'm listening"
       : phase === "thinking"
-        ? "Thinking"
+        ? (activity ?? "Thinking")
         : phase === "speaking"
           ? "Speaking"
           : "Tap to talk";
@@ -1032,9 +1264,11 @@ export default function VoiceApp() {
   const hint =
     phase === "listening"
       ? "Tap the arrow to send now."
-      : phase === "thinking" || phase === "speaking"
-        ? "Tap the mic to interrupt."
-        : autoListen
+      : phase === "thinking"
+        ? "Tap the mic for an update. Stop cancels."
+        : phase === "speaking"
+          ? "Tap the mic to interrupt."
+          : autoListen
           ? "It reopens after each answer."
           : "Hands-free is off.";
 
@@ -1223,9 +1457,11 @@ export default function VoiceApp() {
                 aria-label={
                   phase === "listening"
                     ? "Stop listening and send"
-                    : phase === "thinking" || phase === "speaking"
-                      ? "Interrupt and talk"
-                      : "Start listening"
+                    : phase === "thinking"
+                      ? "Ask for an update"
+                      : phase === "speaking"
+                        ? "Interrupt and talk"
+                        : "Start listening"
                 }
               >
                 {phase === "thinking" ? (
@@ -1383,6 +1619,22 @@ export default function VoiceApp() {
 
               <div className="settingRow">
                 <div className="settingLabel">
+                  <strong>Read full replies</strong>
+                  <span>Off speaks the short answer; details stay on screen</span>
+                </div>
+                <button
+                  type="button"
+                  className={`switchButton ${speakAll ? "on" : ""}`}
+                  onClick={toggleSpeakAll}
+                  aria-pressed={speakAll}
+                  aria-label="Read full replies"
+                >
+                  <span />
+                </button>
+              </div>
+
+              <div className="settingRow">
+                <div className="settingLabel">
                   <strong>Voice</strong>
                   <span>{voiceLabel ?? "System default"}</span>
                 </div>
@@ -1490,7 +1742,7 @@ export default function VoiceApp() {
               <div className="settingRow">
                 <div className="settingLabel">
                   <strong>Model</strong>
-                  <span>Which OpenCode model Ravonna answers with</span>
+                  <span>{sessionInfo?.model?.id ?? "connecting…"}</span>
                 </div>
                 <select
                   className="select"
@@ -1522,13 +1774,6 @@ export default function VoiceApp() {
                 <div className="settingLabel">
                   <strong>Agent</strong>
                   <span>{sessionInfo?.agent ?? "ravonna"}</span>
-                </div>
-              </div>
-
-              <div className="settingRow">
-                <div className="settingLabel">
-                  <strong>Model</strong>
-                  <span>{sessionInfo?.model?.id ?? "connecting…"}</span>
                 </div>
               </div>
             </div>

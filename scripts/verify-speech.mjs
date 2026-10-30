@@ -3,7 +3,13 @@
  * markdown, code fences split across chunks, dashes, run-on text.
  * Run: node scripts/verify-speech.mjs
  */
-import { sanitizeForSpeech, takeSpeakable } from "../src/lib/speech.ts";
+import {
+  correctTranscript,
+  createRecognition,
+  sanitizeForSpeech,
+  speakablePart,
+  takeSpeakable,
+} from "../src/lib/speech.ts";
 
 let failures = 0;
 let checks = 0;
@@ -134,6 +140,175 @@ console.log("\nnumber handling");
   const { segments } = run(source, 7);
   const text = joined(segments);
   check("domain is not split at the dot", text === source, text);
+}
+
+console.log("\nwhat gets spoken");
+{
+  check("emoji is not announced", sanitizeForSpeech("Hey Sir. 👋") === "Hey Sir.", sanitizeForSpeech("Hey Sir. 👋"));
+  check("linked emoji is removed", sanitizeForSpeech("Enjoy ☕ it ❤️") === "Enjoy it", sanitizeForSpeech("Enjoy ☕ it ❤️"));
+  check("paths are not read out", sanitizeForSpeech("Saved in /mnt/c/Users/x.md today") === "Saved in today", sanitizeForSpeech("Saved in /mnt/c/Users/x.md today"));
+  check("and/or is kept", sanitizeForSpeech("this and/or that") === "this and/or that");
+  check("details after a blank line stay silent", speakablePart("It's done.\n\nPID 18680") === "It's done.");
+  check("a list stays silent", speakablePart("Three apps:\n- Edge\n- Chrome") === "Three apps:");
+  check("a table stays silent", speakablePart("Here you go:\n| a | b |") === "Here you go:");
+  check("a numbered list stays silent", speakablePart("Steps:\n1. Open") === "Steps:");
+  check("a plain answer is spoken whole", speakablePart("It's 6:37 PM.") === "It's 6:37 PM.");
+  check("a line starting with a number is kept", speakablePart("Sure.\n2 windows are open.").includes("2 windows"));
+  check(
+    "corrections leave ordinary words alone",
+    correctTranscript("the cloud is dark, open brave") === "the cloud is dark, open brave",
+  );
+  check("foreground is restored", correctTranscript("what is on 4 ground") === "what is on foreground");
+  const { segments } = takeSpeakable("हो गया। अब देखो।", true);
+  check("hindi sentence ends split", segments.length === 2, JSON.stringify(segments));
+}
+
+console.log("\nend of speech");
+{
+  class FakeRecognition {
+    start() {}
+    stop() {
+      this.onend();
+    }
+    abort() {
+      this.onend();
+    }
+  }
+  globalThis.window = { webkitSpeechRecognition: FakeRecognition };
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const result = (transcript, isFinal) => Object.assign([{ transcript }], { isFinal });
+
+  function listen() {
+    const sent = [];
+    const recognition = createRecognition({
+      lang: "en-IN",
+      onInterim: () => {},
+      onFinal: (text) => sent.push(text),
+      onError: () => {},
+      onEnd: () => {},
+    });
+    return { sent, recognition };
+  }
+
+  let live;
+  globalThis.window.webkitSpeechRecognition = class extends FakeRecognition {
+    constructor() {
+      super();
+      live = this;
+    }
+  };
+
+  {
+    const { sent } = listen();
+    live.onresult({ resultIndex: 0, results: [result("turn off the", true)] });
+    await sleep(1_000);
+    live.onresult({ resultIndex: 1, results: [result("turn off the", true), result("kitchen light", true)] });
+    await sleep(1_000);
+    check("a short pause does not split the turn", sent.length === 0, JSON.stringify(sent));
+    await sleep(1_100);
+    check("silence sends the whole turn once", sent.length === 1 && sent[0] === "turn off the kitchen light", JSON.stringify(sent));
+    live.onend();
+    check("the end event does not send it twice", sent.length === 1, JSON.stringify(sent));
+  }
+  {
+    const { sent, recognition } = listen();
+    live.onresult({ resultIndex: 0, results: [result("send this", false)] });
+    recognition.stop();
+    check("tap to send keeps unconfirmed words", sent[0] === "send this", JSON.stringify(sent));
+  }
+  {
+    const { sent, recognition } = listen();
+    live.onresult({ resultIndex: 0, results: [result("never mind", false)] });
+    recognition.abort();
+    await sleep(2_400);
+    check("abort discards what was heard", sent.length === 0, JSON.stringify(sent));
+  }
+  {
+    const { sent, recognition } = listen();
+    recognition.stop();
+    check("silence sends nothing", sent.length === 0, JSON.stringify(sent));
+  }
+  {
+    const { sent, recognition } = listen();
+    live.onresult({ resultIndex: 0, results: [result("so I want you to", true)] });
+    await sleep(2_400);
+    check("an unfinished sentence waits longer", sent.length === 0, JSON.stringify(sent));
+    recognition.abort();
+  }
+  {
+    const { sent, recognition } = listen();
+    live.onresult({ resultIndex: 0, results: [result("open the cloud extension", true)] });
+    recognition.stop();
+    check("known mishearings are corrected before sending", sent[0] === "open the Claude extension", JSON.stringify(sent));
+  }
+
+  // Android re-reports the sentence as a new result each time it grows.
+  const growing = (sentence, finalFrom = 0) => {
+    const words = sentence.split(" ");
+    const results = [];
+    words.forEach((_, i) => {
+      const text = words.slice(0, i + 1).join(" ");
+      results.push(result(text, i >= finalFrom));
+      if (i % 3 === 0) results.push(result(text, i >= finalFrom));
+      live.onresult({ resultIndex: results.length - 1, results: [...results] });
+    });
+  };
+
+  {
+    const { sent, recognition } = listen();
+    const sentence = "okay so tell me can you have access of all the sessions";
+    growing(sentence);
+    recognition.stop();
+    check("growing results are not repeated", sent[0] === sentence, JSON.stringify(sent));
+  }
+  {
+    const { sent, recognition } = listen();
+    growing("hello are you able to listen me", 3);
+    recognition.stop();
+    check("mixed interim results are not repeated", sent[0] === "hello are you able to listen me", JSON.stringify(sent));
+  }
+  {
+    const { sent, recognition } = listen();
+    live.onresult({
+      resultIndex: 0,
+      results: [result("are you able to listen", true), result("are you able to listen me", true), result("are you", true)],
+    });
+    recognition.stop();
+    check("a shorter revision is ignored", sent[0] === "are you able to listen me", JSON.stringify(sent));
+  }
+  {
+    const { sent, recognition } = listen();
+    live.onresult({
+      resultIndex: 0,
+      results: [result("are you able to listen", true), result("are you abel to listen me", true)],
+    });
+    recognition.stop();
+    check("a corrected word replaces the old line", sent[0] === "are you abel to listen me", JSON.stringify(sent));
+  }
+  {
+    const { sent, recognition } = listen();
+    live.onresult({
+      resultIndex: 0,
+      results: [result("turn off the light", true), result("and lock the door", true)],
+    });
+    recognition.stop();
+    check("separate sentences are both kept", sent[0] === "turn off the light and lock the door", JSON.stringify(sent));
+  }
+  {
+    Object.defineProperty(globalThis, "navigator", {
+      value: { userAgent: "Mozilla/5.0 (Linux; Android 14) Chrome/140 Mobile" },
+      configurable: true,
+    });
+    const { sent } = listen();
+    check("android uses single-shot recognition", live.continuous === false, String(live.continuous));
+    live.onresult({ resultIndex: 0, results: [result("still thinking about", false)] });
+    await sleep(1_700);
+    check("android waits for the browser to end the turn", sent.length === 0, JSON.stringify(sent));
+    live.onresult({ resultIndex: 0, results: [result("still thinking about it", true)] });
+    live.onend();
+    check("android sends when recognition ends", sent[0] === "still thinking about it", JSON.stringify(sent));
+  }
 }
 
 console.log(`\n${checks - failures}/${checks} checks passed\n`);

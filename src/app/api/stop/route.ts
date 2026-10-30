@@ -1,6 +1,7 @@
-import { interruptSession } from "@/lib/opencode";
+import { cachedSession } from "@/lib/opencode";
+import { interruptAndWait } from "@/lib/events";
 import { guardRequest } from "@/lib/http";
-import { activeTurnId } from "@/lib/turn";
+import { activeTurnId, settled, trackSettling } from "@/lib/turn";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -20,12 +21,16 @@ export async function POST(request: Request) {
     }
   }
 
-  // A stop aimed at an old turn is ignored once that turn is over. Without an
-  // id (curl, scripts), interrupt whatever is running.
+  // A stop aimed at an old turn is ignored once that turn is over, but still
+  // waits for its shutdown: the browser treats this response as the all-clear
+  // to reopen the mic. Without an id (curl, scripts), interrupt what is running.
   if (turnId && activeTurnId() !== turnId) {
+    await settled();
     return Response.json({ ok: true, ignored: true });
   }
 
-  await interruptSession();
+  const session = cachedSession();
+  if (session) trackSettling(interruptAndWait(session.id));
+  await settled();
   return Response.json({ ok: true });
 }

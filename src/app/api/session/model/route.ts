@@ -1,6 +1,7 @@
 import type { NextRequest } from "next/server";
 import { agentConfig, ensureSessionFor, OpenCodeError, type OpenCodeModel } from "@/lib/opencode";
 import { guardRequest } from "@/lib/http";
+import { activeTurnId } from "@/lib/turn";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -9,12 +10,18 @@ const MAX_MODEL_LENGTH = 200;
 
 /**
  * Applies a model to the next session and starts a fresh conversation on it.
- * The switch is meant to happen between turns; a prompt already running owns
- * the current turn and is not touched.
+ * Refused during a turn: replacing the session would orphan the running prompt.
  */
 export async function POST(request: NextRequest) {
   const blocked = guardRequest(request, { json: true });
   if (blocked) return blocked;
+
+  if (activeTurnId()) {
+    return Response.json(
+      { ok: false, error: "Stop the current reply before switching models." },
+      { status: 409 },
+    );
+  }
 
   let payload: unknown;
   try {
