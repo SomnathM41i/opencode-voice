@@ -2,6 +2,7 @@ node_modules
 .next
 out
 .env.local
+.lan
 *.log
 .DS_Store
 next-env.d.ts

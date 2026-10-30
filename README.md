@@ -101,8 +101,35 @@ to the Home Screen via **Share → Add to Home Screen**.
 - The service worker is network-first and never caches `/api/*`, so answers are
   always fresh; it only keeps the shell available if the network blips.
 - A phone install needs HTTPS (both for the mic and for the service worker).
-  Serve the app through a trusted TLS reverse proxy and add its origin to
-  `ALLOWED_ORIGINS` before installing on a phone.
+  See **Use it from your phone**.
+
+## Use it from your phone
+
+`npm run lan` starts an HTTPS gateway on the laptop for phones on the same
+network or hotspot. Next and OpenCode stay on `127.0.0.1`; the gateway owns the
+certificate, the login, and who may connect.
+
+Run it on **Windows** (not WSL), with the app already running:
+
+```powershell
+npm run lan
+```
+
+First time only:
+
+1. As administrator, allow the port on the hotspot or Wi-Fi only:
+   `powershell -ExecutionPolicy Bypass -File scriptslan-firewall.ps1`
+2. On the phone, open the `CA cert` address the gateway prints and accept the
+   warning, since the phone does not trust it yet.
+3. Install the download: Settings → Security → Encryption & credentials →
+   Install a certificate → CA certificate.
+4. Open the printed address and sign in with `LAN_PASSWORD` from `.env.local`.
+   The phone stays signed in for 30 days.
+
+The certificate authority can only vouch for private IP addresses, so it cannot
+be used to impersonate a public website. If the laptop gets a new address, the
+gateway reissues its certificate on its own; just open the new address. Changing
+`LAN_PASSWORD` and restarting the gateway signs every device out.
 
 ## Configuration
 
@@ -117,6 +144,7 @@ to the Home Screen via **Share → Add to Home Screen**.
 | `OPENCODE_MODEL` | Model id (default `big-pickle` in code; `.env.local` ships `deepseek-v4.1-flash-free`, the fastest measured) |
 | `OPENCODE_VARIANT` | Optional model variant |
 | `OPENCODE_DIRECTORY` | Working directory for sessions |
+| `LAN_PASSWORD` | Phone login for `npm run lan` (generated on first run) |
 
 ## How it works
 
@@ -149,6 +177,7 @@ OpenCode on 127.0.0.1:4096
 
 - The app trusts `localhost` only by default. To use another origin (phone,
   LAN), add it to `ALLOWED_ORIGINS` in `.env.local`, comma-separated.
+- Never expose port 3000 directly: it has no login. Phones go through `npm run lan`.
 - Binding the OpenCode server to anything other than `127.0.0.1` is not
   recommended; the Next app exists to keep its password server-side.
 
